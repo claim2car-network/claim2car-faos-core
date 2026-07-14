@@ -1,0 +1,116 @@
+version: "3.8"
+
+services:
+  # =========================================================================
+  # 1. CORE FORENSIC BACKEND SERVICE (FastAPI)
+  # =========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: claim2car-faos-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URL=mongodb://mongodb:27017
+      - DB_NAME=claim2car_db
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/claim2car_db
+      - JWT_SECRET=dev-super-secret-key-change-in-production-32-chars-min
+      - JWT_ALGORITHM=HS256
+      - JWT_EXP_HOURS=24
+      - CORS_ORIGINS=*
+      - ANCHOR_ADAPTER=none # none | mock_sandbox | polygon | base
+      - ANCHOR_POLYGON_RPC_URL=https://polygon-rpc.com
+      - ANCHOR_POLYGON_PRIVATE_KEY=your_private_key_here
+      - XAI_API_KEY=your_xai_grok_key_here
+      - RESEND_API_KEY=your_resend_email_key_here
+    volumes:
+      - ./backend:/app
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - c2c_network
+
+  # =========================================================================
+  # 2. FORENSIC ARTIFACT & METADATA STORAGE (MongoDB)
+  # =========================================================================
+  mongodb:
+    image: mongo:6.0
+    container_name: claim2car-faos-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - c2c_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # =========================================================================
+  # 3. REAL-TIME NERVE SYSTEM & AUCTION QUEUE (Redis)
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: claim2car-faos-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - c2c_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # =========================================================================
+  # 4. B2B RELATIONAL & TRANSACTIONAL VAULT (PostgreSQL)
+  # =========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: claim2car-faos-postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=claim2car_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql
+    networks:
+      - c2c_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d claim2car_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+networks:
+  c2c_network:
+    driver: bridge
