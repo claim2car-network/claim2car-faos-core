@@ -1,116 +1,233 @@
-version: "3.8"
+# CLAIM2CAR FAOS - HARDENED PRODUCTION DOCKER COMPOSE
+# Phase 1: Zero-Trust Container Network Isolation
+# WARNING: Database ports NOT exposed to host. All communication via private bridge network.
+
+version: '3.8'
 
 services:
-  # =========================================================================
-  # 1. CORE FORENSIC BACKEND SERVICE (FastAPI)
-  # =========================================================================
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: claim2car-faos-backend
-    restart: always
-    ports:
-      - "8000:8000"
-    environment:
-      - MONGO_URL=mongodb://mongodb:27017
-      - DB_NAME=claim2car_db
-      - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/claim2car_db
-      - JWT_SECRET=dev-super-secret-key-change-in-production-32-chars-min
-      - JWT_ALGORITHM=HS256
-      - JWT_EXP_HOURS=24
-      - CORS_ORIGINS=*
-      - ANCHOR_ADAPTER=none # none | mock_sandbox | polygon | base
-      - ANCHOR_POLYGON_RPC_URL=https://polygon-rpc.com
-      - ANCHOR_POLYGON_PRIVATE_KEY=your_private_key_here
-      - XAI_API_KEY=your_xai_grok_key_here
-      - RESEND_API_KEY=your_resend_email_key_here
-    volumes:
-      - ./backend:/app
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+  # ═══════════════════════════════════════════════════════════════
+  # PostgreSQL 16+ with PostGIS (WORM Evidence Layer)
+  # ═══════════════════════════════════════════════════════════════
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: faos-postgres
     networks:
-      - c2c_network
+      - backend-network
+    ports: []  # ✅ NO EXPOSURE TO HOST - was "5432:5432"
+    environment:
+      POSTGRES_DB: claim2car
+      POSTGRES_USER_FILE: /run/secrets/postgres_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "-c shared_preload_libraries=pgcrypto"
+    secrets:
+      - postgres_user
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "claim2car"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # =========================================================================
-  # 2. FORENSIC ARTIFACT & METADATA STORAGE (MongoDB)
-  # =========================================================================
+  # ═══════════════════════════════════════════════════════════════
+  # MongoDB 7.0 (Event Ledger & Audit Logs)
+  # ═══════════════════════════════════════════════════════════════
   mongodb:
-    image: mongo:6.0
-    container_name: claim2car-faos-mongodb
-    restart: always
-    ports:
-      - "27017:27017"
+    image: mongo:7.0-alpine
+    container_name: faos-mongodb
+    networks:
+      - backend-network
+    ports: []  # ✅ NO EXPOSURE TO HOST - was "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: claim2car_events
+      MONGO_INITDB_ROOT_USERNAME_FILE: /run/secrets/mongo_user
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_password
+    secrets:
+      - mongo_user
+      - mongo_password
     volumes:
       - mongodb_data:/data/db
-    networks:
-      - c2c_network
+      - ./scripts/init-mongo.js:/docker-entrypoint-initdb.d/01-init.js:ro
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+    restart: unless-stopped
 
-  # =========================================================================
-  # 3. REAL-TIME NERVE SYSTEM & AUCTION QUEUE (Redis)
-  # =========================================================================
+  # ═══════════════════════════════════════════════════════════════
+  # Redis 7.0 (Cache & Pub/Sub for WebSocket Events)
+  # ═══════════════════════════════════════════════════════════════
   redis:
     image: redis:7-alpine
-    container_name: claim2car-faos-redis
-    restart: always
-    ports:
-      - "6379:6379"
+    container_name: faos-redis
+    networks:
+      - backend-network
+    ports: []  # ✅ NO EXPOSURE TO HOST - was "6379:6379"
+    command: >
+      redis-server
+      --requirepass $(cat /run/secrets/redis_password)
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    secrets:
+      - redis_password
     volumes:
       - redis_data:/data
-    networks:
-      - c2c_network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 5s
+    restart: unless-stopped
 
-  # =========================================================================
-  # 4. B2B RELATIONAL & TRANSACTIONAL VAULT (PostgreSQL)
-  # =========================================================================
-  postgres:
-    image: postgres:15-alpine
-    container_name: claim2car-faos-postgres
-    restart: always
+  # ═══════════════════════════════════════════════════════════════
+  # FastAPI Backend (FAOS Engine)
+  # ═══════════════════════════════════════════════════════════════
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faos-backend
+    networks:
+      - backend-network
     ports:
-      - "5432:5432"
+      - "8000:8000"  # ✅ Only FastAPI exposed (behind Nginx TLS proxy)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=claim2car_db
+      # Database Configuration
+      DATABASE_URL: postgresql://postgres@postgres:5432/claim2car
+      MONGODB_URL: mongodb://mongodb:27017/claim2car_events
+      REDIS_URL: redis://redis:6379/0
+      
+      # Secrets Management
+      VAULT_ENABLED: "true"
+      VAULT_ADDR: "${VAULT_ADDR:-http://vault:8200}"
+      VAULT_TOKEN_FILE: /run/secrets/vault_token
+      
+      # Security Settings
+      ENV: production
+      DEBUG: "false"
+      LOG_LEVEL: info
+      
+      # CORS Configuration
+      CORS_ORIGINS: "*.claim2car.com,track.claim2car.com"
+      
+      # JWT & Cryptography
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRATION_HOURS: 24
+      ENCRYPTION_ALGORITHM: AES-256-GCM
+      
+      # Feature Flags
+      ENABLE_WASM_DARCI: "true"
+      ENABLE_BATCH_SETTLEMENT: "true"
+      ENABLE_WEBSOCKET_ROUTING: "true"
+      
+      # Third-Party APIs
+      NHTSA_VPIC_ENDPOINT: "https://vpic.nhtsa.dot.gov/api/vehicles"
+      SQUARE_API_KEY_FILE: /run/secrets/square_api_key
+      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
+    secrets:
+      - postgres_user
+      - postgres_password
+      - mongo_user
+      - mongo_password
+      - redis_password
+      - vault_token
+      - square_api_key
+      - resend_api_key
+      - jwt_secret
+      - encryption_key
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./infrastructure/init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql
-    networks:
-      - c2c_network
+      - ./app:/app/app:ro
+      - ./logs:/app/logs
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d claim2car_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
+  # ═══════════════════════════════════════════════════════════════
+  # Nginx TLS 1.3 Reverse Proxy (HTTPS Gateway)
+  # ═══════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:alpine
+    container_name: faos-nginx
+    networks:
+      - backend-network
+    ports:
+      - "80:80"    # HTTP redirect only
+      - "443:443"  # HTTPS (TLS 1.3)
+    depends_on:
+      - fastapi
+    volumes:
+      - ./infrastructure/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
+    restart: unless-stopped
+
+# ═════════════════════════════════════════════════════════════════
+# SECRETS (External - Loaded from HashiCorp Vault or .env)
+# ═════════════════════════════════════════════════════════════════
+secrets:
+  postgres_user:
+    external: true
+  postgres_password:
+    external: true
+  mongo_user:
+    external: true
+  mongo_password:
+    external: true
+  redis_password:
+    external: true
+  vault_token:
+    external: true
+  square_api_key:
+    external: true
+  resend_api_key:
+    external: true
+  jwt_secret:
+    external: true
+  encryption_key:
+    external: true
+
+# ═════════════════════════════════════════════════════════════════
+# VOLUMES (Persistent Data)
+# ═════════════════════════════════════════════════════════════════
 volumes:
+  postgres_data:
+    driver: local
   mongodb_data:
     driver: local
   redis_data:
     driver: local
-  postgres_data:
+  nginx_cache:
     driver: local
 
+# ═════════════════════════════════════════════════════════════════
+# NETWORKS (Private Bridge - No Host Exposure)
+# ═════════════════════════════════════════════════════════════════
 networks:
-  c2c_network:
+  backend-network:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-faos-core
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
